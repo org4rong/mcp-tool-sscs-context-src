@@ -1,0 +1,149 @@
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: update-deployment
+  labels:
+    app.kubernetes.io/version: "0.1"
+spec:
+  description: Task to update deployment with newly built image in gitops repository.
+  params:
+    - name: gitops-repo-url
+      type: string
+      description: URL of gitops repository to update with the newly built image.
+    - name: image
+      type: string
+      description: Reference of the newly built image to use.
+    - name: gitops-auth-secret-name
+      type: string
+      default: gitops-auth-secret
+      description: |
+        Secret of basic-auth type containing credentials to commit into gitops repository.
+    - name: git-url
+      type: string
+      description: |
+        This is a PipelineRun parameter recording source repo URL.
+    - name: revision
+      type: string
+      description: |
+        This is a PipelineRun parameter recording source repo revision.
+  workspaces:
+    - name: gitops-auth
+      optional: true
+  steps:
+    - name: patch-gitops
+      image: quay.io/redhat-tssc/task-runner:1.7
+      imagePullPolicy: Always
+      env:
+        - name: PARAM_GITOPS_REPO_URL
+          value: $(params.gitops-repo-url)
+        - name: PARAM_IMAGE
+          value: $(params.image)
+        - name: WORKSPACE_GITOPS_AUTH_DIRECTORY_BOUND
+          value: $(workspaces.gitops-auth.bound)
+        - name: WORKSPACE_GITOPS_AUTH_DIRECTORY_PATH
+          value: $(workspaces.gitops-auth.path)
+        - name: PARAM_URL
+          value: $(params.git-url)
+        - name: PARAM_REV
+          value: $(params.revision)
+        - name: SCAN_OUTPUT
+          value: $(tasks.acs-image-scan.results.SCAN_OUTPUT)
+        - name: SCAN_COMMAND
+          value: $(tasks.acs-image-scan.results.SCAN_COMMAND)
+      script: |2
+
+        if [ "${WORKSPACE_GITOPS_AUTH_DIRECTORY_BOUND}" = "true" ] ; then
+          if [ -f "${WORKSPACE_GITOPS_AUTH_DIRECTORY_PATH}/.git-credentials" ] && [ -f "${WORKSPACE_GITOPS_AUTH_DIRECTORY_PATH}/.gitconfig" ]; then
+            cp "${WORKSPACE_GITOPS_AUTH_DIRECTORY_PATH}/.git-credentials" "${HOME}/.git-credentials"
+            cp "${WORKSPACE_GITOPS_AUTH_DIRECTORY_PATH}/.gitconfig" "${HOME}/.gitconfig"
+          # Compatibility with kubernetes.io/basic-auth secrets
+          elif [ -f "${WORKSPACE_GITOPS_AUTH_DIRECTORY_PATH}/username" ] && [ -f "${WORKSPACE_GITOPS_AUTH_DIRECTORY_PATH}/password" ]; then
+            HOSTNAME=$(echo "${PARAM_GITOPS_REPO_URL}" | awk -F/ '{print $3}')
+            echo "https://$(cat "${WORKSPACE_GITOPS_AUTH_DIRECTORY_PATH}/username"):$(cat "${WORKSPACE_GITOPS_AUTH_DIRECTORY_PATH}/password")@$HOSTNAME" > "${HOME}/.git-credentials"
+            printf "[credential \"https://%s\"]\n helper = store" "${HOSTNAME}" > "${HOME}/.gitconfig"
+          else
+            echo "Unknown basic-auth workspace format"
+            exit 1
+          fi
+          chmod 400 "${HOME}/.git-credentials"
+          chmod 400 "${HOME}/.gitconfig"
+        else
+          echo "git credentials to push into gitops repository ${PARAM_GITOPS_REPO_URL} is not configured."
+          echo "gitops repository is not updated automatically."
+          echo "You can update gitops repository with the new image: ${PARAM_IMAGE} manually"
+          echo "TODO: configure git credentials to update gitops repository."
+          exit 0
+        fi
+
+        git config --global user.email "rhtap@noreplay.com"
+        git config --global user.name "gitops-update"
+
+        git clone ${PARAM_GITOPS_REPO_URL}
+        gitops_repo_url=${PARAM_GITOPS_REPO_URL%'.git'}
+        gitops_repo_name=$(basename ${gitops_repo_url})
+        cd ${gitops_repo_name}
+
+        export component_name=$(yq .metadata.name application.yaml)
+        overlays_filepath="components/${component_name}/overlays"
+        patch_filename="deployment-patch.yaml"
+
+        deployment_patch_filepath="components/${component_name}/overlays/development/${patch_filename}"
+        IMAGE_PATH='.spec.template.spec.containers[0].image'
+        old_image=$(yq "${IMAGE_PATH}" "${deployment_patch_filepath}")
+        yq e -i "${IMAGE_PATH} |= \"${PARAM_IMAGE}\"" "${deployment_patch_filepath}"
+
+        ###
+        # Add "sscs-repo-permalink" annotation to deployment_patch YAML files
+        #
+        export PERMALINK
+        if [[ ! -z $(echo "${PARAM_URL}" | grep "gitlab.com") ]]; then
+          PERMALINK="${PARAM_URL}/-/commit/${PARAM_REV}"
+        else
+          PERMALINK="${PARAM_URL}/commit/${PARAM_REV}"
+        fi
+        
+        echo "Add \"sscs-repo-permalink\" annotation to \"${deployment_patch_filepath}\""
+        yq -i 'with(.metadata.annotations; .sscs-repo-permalink = strenv(PERMALINK))' "${deployment_patch_filepath}"
+
+        # Add "sccs-image-risk" annotation per summary for the image vulnerabiliies
+        # in terms of "cveSeverity": CRITICAL, IMPORTANT, MODERATE, LOW
+        # Set risk value 8 for CRITICAL as 8, 6 for IMPORTANT, 4 for MODERATE, or 2 for LOW
+
+        echo "Image scan summary: ${SCAN_OUTPUT}"
+        if [[ -n "${SCAN_OUTPUT}" ]]; then
+          vuln=$(echo ${SCAN_OUTPUT} | jq -r '.vulnerabilities')
+          critical=$(echo $vuln | jq .critical)
+          high=$(echo $vuln | jq .high)
+          medium=$(echo $vuln | jq .medium)
+          low=$(echo $vuln | jq .low)
+
+          export IMAGE_RISK=0
+          if [[ (-n $critical) && ($critical != 0) ]]; then
+            IMAGE_RISK=8
+          elif [[ (-n $high) && ($high != 0) ]]; then
+            IMAGE_RISK=6
+          elif [[ (-n $medium) && ($medium != 0) ]]; then
+            IMAGE_RISK=4
+          elif [[ (-n $low) && ($low != 0) ]]; then
+            IMAGE_RISK=2
+          fi
+
+          echo "Add \"sccs-image-risk\" annotation for \"${PARAM_IMAGE}\""
+          yq -i 'with(.metadata.annotations; .sscs-image-risk = env(IMAGE_RISK))' "${deployment_patch_filepath}"
+
+          export SCAN_COMMAND
+          echo "Add \"sccs-image-scanner\" annotation for \"${PARAM_IMAGE}\""
+          yq -i 'with(.metadata.annotations; .sscs-image-scanner = env(SCAN_COMMAND))' "${deployment_patch_filepath}"
+        fi
+
+        git add .
+        git commit -m "Update '${component_name}' component image to: ${PARAM_IMAGE}"
+        git push 2> /dev/null || \
+        {
+          echo "Failed to push update to gitops repository: ${PARAM_GITOPS_REPO_URL}"
+          echo 'Do you have correct git credentials configured?'
+          exit 1
+        }
+        echo "Successfully updated development image from ${old_image} to ${PARAM_IMAGE}"
+
+
