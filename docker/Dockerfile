@@ -1,8 +1,7 @@
 FROM registry.access.redhat.com/ubi9/python-312:latest
 
-# By default, listen on port 8081
-EXPOSE 8081/tcp
-ENV FLASK_PORT=8081
+# By default, listen on port 8000
+EXPOSE 8000/tcp
 
 # Set the working directory in the container
 WORKDIR /projects
